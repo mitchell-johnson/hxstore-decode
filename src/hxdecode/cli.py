@@ -318,6 +318,34 @@ def mail_show(record_id: int, show_hex: bool, path: str | None) -> None:
     sys.exit(1)
 
 
+@mail.command("body")
+@click.argument("record_id", type=int)
+@click.option("--html", "show_html", is_flag=True, help="Show raw HTML instead of plain text.")
+@click.option("--path", default=None, type=click.Path(), help="Path to HxStore.hxd file.")
+def mail_body(record_id: int, show_html: bool, path: str | None) -> None:
+    """Extract and display the email body for a record."""
+    from hxdecode.body import BodyIndex
+
+    store = _open_store(path)
+    index = BodyIndex(store)
+    body = index.get_body(record_id)
+
+    if body is None:
+        click.echo(f"No body found for record {record_id}.", err=True)
+        sys.exit(1)
+
+    click.echo(f"Record: {record_id}")
+    click.echo(f"Source: {body.source}")
+    if body.source == "sibling":
+        click.echo(f"Body from record: {body.record_id}")
+    click.echo("---")
+
+    if show_html and body.html:
+        click.echo(body.html)
+    else:
+        click.echo(body.text)
+
+
 # ---------------------------------------------------------------------------
 # records
 # ---------------------------------------------------------------------------
