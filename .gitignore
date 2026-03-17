@@ -1,0 +1,27 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Research/analysis scripts (not part of the tool)
+analysis/
+
+# Logs
+*.log
+
+# Testing
+.pytest_cache/
+
+# macOS
+.DS_Store
