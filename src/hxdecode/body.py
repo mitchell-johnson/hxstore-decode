@@ -125,6 +125,9 @@ class BodyIndex:
     with HTML bodies, enabling cross-record body resolution.
     """
 
+    # Offsets in decompressed 0x10013 records where _messageDataId is stored
+    _MSG_DATA_ID_OFFSETS = (632, 652, 848)
+
     def __init__(self, store: HxStoreFile) -> None:
         self._store = store
         # message_id -> (record_id, decompressed_bytes)
@@ -200,7 +203,22 @@ class BodyIndex:
                     source="inline",
                 )
 
-        # 2. Sibling via message-ID (check inline HTML and EFMData)
+        # 2a. _messageDataId link (0x10013 -> 0x03B0)
+        for offset in self._MSG_DATA_ID_OFFSETS:
+            if offset + 4 > len(decompressed):
+                continue
+            data_id = struct.unpack_from("<I", decompressed, offset)[0]
+            if data_id != record_id and data_id in self._html_by_rid:
+                html = extract_html_body(self._html_by_rid[data_id])
+                if html:
+                    return EmailBody(
+                        record_id=data_id,
+                        html=html,
+                        text=html_to_text(html),
+                        source="messagedata",
+                    )
+
+        # 2b. Sibling via message-ID (check inline HTML and EFMData)
         sibling_rid = None
         for s in utf16:
             if s.startswith("<") and "@" in s and s.endswith(">"):
