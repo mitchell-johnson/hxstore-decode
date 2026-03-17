@@ -373,34 +373,43 @@ class HxStoreFile:
         raw = self._data[data_start:data_end]
         return RawRecord(slot_header=header, raw_data=raw)
 
+    def _iter_records_on_page(self, page_num: int) -> Iterator[RawRecord]:
+        """Yield data records from a single page, handling multi-slot spans."""
+        skip_until: int = -1
+
+        for slot_num in range(SLOTS_PER_PAGE):
+            if slot_num <= skip_until:
+                continue
+
+            record = self.read_record(page_num, slot_num)
+            if record is None:
+                continue
+
+            yield record
+
+            if record.slot_header.size_a > SLOT_DATA_SIZE:
+                total_bytes = SLOT_HEADER_SIZE + record.slot_header.size_a
+                slots_used = (total_bytes + SLOT_SIZE - 1) // SLOT_SIZE
+                skip_until = slot_num + slots_used - 1
+
     def iter_data_records(self) -> Iterator[RawRecord]:
         """Yield every valid data record in the file.
 
-        Iterates over all data pages, checks each slot, and yields
-        records.  Multi-slot records are handled transparently.
-
-        Slots whose data has already been consumed by a preceding
-        multi-slot record are skipped automatically.
+        Iterates over all data pages AND index pages (which may contain
+        data record slots alongside index nodes), checks each slot, and
+        yields records.  Multi-slot records are handled transparently.
         """
-        for page_num, _ in self.iter_pages(PageType.DATA):
-            skip_until: int = -1
+        seen: set[int] = set()
 
-            for slot_num in range(SLOTS_PER_PAGE):
-                if slot_num <= skip_until:
+        for page_num, ptype in self.iter_pages():
+            if ptype not in (PageType.DATA, PageType.INDEX):
+                continue
+            for record in self._iter_records_on_page(page_num):
+                # Deduplicate by file offset (a record can only appear once)
+                if record.slot_header.file_offset in seen:
                     continue
-
-                record = self.read_record(page_num, slot_num)
-                if record is None:
-                    continue
-
+                seen.add(record.slot_header.file_offset)
                 yield record
-
-                # If this record spanned multiple slots, skip the
-                # continuation slots.
-                if record.slot_header.size_a > SLOT_DATA_SIZE:
-                    total_bytes = SLOT_HEADER_SIZE + record.slot_header.size_a
-                    slots_used = (total_bytes + SLOT_SIZE - 1) // SLOT_SIZE
-                    skip_until = slot_num + slots_used - 1
 
     # -- convenience ---------------------------------------------------------
 

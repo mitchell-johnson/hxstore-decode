@@ -448,18 +448,59 @@ file_data.find(query.encode("utf-16-le"))
 
 ## 11. Index Pages (B-tree / Cola)
 
-Pages carrying the **secondary store_id** are **B-tree index pages** managed by the Cola storage engine.
+Pages carrying the **secondary store_id** contain **B-tree index nodes** managed by the Cola storage engine. These pages share the same 8-slot-per-page layout as data pages — individual slots may contain either index nodes or data records.
+
+### Mixed Page Layout
+
+Index pages use the same 8 x 512-byte slot structure as data pages. Each slot is independently typed:
+- Slots with the **secondary store_id** and type=8 are **index nodes**
+- Slots with the **primary store_id** and type=8 are **data records** (emails, metadata)
+
+This means **data records can live on index pages**. In a typical database, ~61 data records are found on index pages that would be missed by scanning only primary-store-ID pages.
+
+### Index Node Header (32 bytes)
+
+| Offset | Size | Type | Description |
+|--------|------|------|-------------|
+| 0x00 | 8 | uint64_le | Node hash |
+| 0x08 | 8 | bytes | Secondary store_id |
+| 0x10 | 4 | uint32_le | Node ID (unique per node) |
+| 0x14 | 4 | uint32_le | Always 0x200 (512 = slot size) |
+| 0x18 | 4 | uint32_le | Entry region end offset (0x20 + entry_count * 20) |
+| 0x1C | 4 | uint32_le | B-tree level (1 = leaf, 2 = internal) |
+
+### Index Entries (20 bytes each)
+
+Starting at offset 0x20 within the slot, entries are packed sequentially:
+
+| Offset | Size | Type | Description |
+|--------|------|------|-------------|
+| 0x00 | 4 | uint32_le | Key (sorted ascending within node) |
+| 0x04 | 4 | uint32_le | Type (always 8) |
+| 0x08 | 4 | uint32_le | val1 — typically points to blob pages |
+| 0x0C | 4 | uint32_le | val2 — matches record IDs at ~39% |
+| 0x10 | 4 | uint32_le | Reserved (always 0) |
+
+### B-tree Structure
 
 | Property | Value |
 |----------|-------|
-| Typical count | ~1,100 pages |
-| Store ID | Secondary (distinct from data pages) |
-| Internal structure | B-tree nodes |
-| Status | **Not yet decoded** |
+| Typical index nodes | ~82 (62 internal, 20 leaf) |
+| Entries per node | 1--2 (sparse; capacity for ~24) |
+| Keys sorted within node | 83% ascending |
+| Level 1 (leaf) | val1 may reference child index pages |
+| Level 2 (internal) | Contains range keys for subtree navigation |
 
-These pages likely contain lookup indices mapping record IDs, email addresses, or timestamps to data page locations. The Cola engine's `IndexPage`, `IndexPageCache`, and `KvStoreReader` classes (visible in HxCore's symbol table) manage these structures.
+The val1/val2 fields encode cumulative subtree size information rather than direct page pointers. The tree navigation mechanism uses range-based key comparison rather than explicit child page pointers. Full traversal is not yet implemented.
 
-Because the index format is not decoded, all record lookups currently require a full sequential scan of data pages.
+### Statistics
+
+| Metric | Value |
+|--------|-------|
+| Index pages | ~37 |
+| Index nodes across all pages | ~82 |
+| Data records found on index pages | ~61 |
+| Dense index region | Pages 4573--5489 (all 8 slots are index nodes) |
 
 ---
 
