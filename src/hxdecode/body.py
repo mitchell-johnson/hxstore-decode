@@ -1,15 +1,17 @@
 """Email body extraction from HxStore records.
 
 Provides functions to extract HTML and plain-text email bodies from
-decompressed record data, and to link records via message-IDs to find
-the best available body content.
+decompressed record data, link records via message-IDs, and resolve
+bodies from EFMData gzip files on disk.
 """
 
 from __future__ import annotations
 
+import gzip
 import re
 import struct
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator
 
 from hxdecode.decompress import decompress_record
@@ -131,12 +133,17 @@ class BodyIndex:
         self._html_by_rid: dict[int, bytes] = {}
         # record_id -> (format_type, decompressed_bytes, utf16_strings)
         self._all_records: dict[int, tuple[int, bytes, list[str]]] = {}
+        # record_id -> list of EFMData file paths
+        self._efm_by_rid: dict[int, list[Path]] = {}
         self._built = False
 
     def build(self) -> None:
         """Scan all records and build the body index."""
         if self._built:
             return
+
+        efm_re = re.compile(r"EFMData/(\d+)\.dat")
+        profile_dir = self._store.path.parent
 
         for rec in self._store.iter_data_records():
             raw_ft = struct.unpack_from("<I", rec.raw_data, 8)[0]
@@ -149,10 +156,20 @@ class BodyIndex:
             has_html = b"<html" in decompressed or b"<HTML" in decompressed
             if has_html and raw_ft in _HTML_FORMATS:
                 self._html_by_rid[rid] = decompressed
-                # Index by message-ID
                 for s in utf16:
                     if s.startswith("<") and "@" in s and s.endswith(">"):
                         self._html_by_msgid[s] = (rid, decompressed)
+
+            # Index EFMData references
+            for s in utf16:
+                m = efm_re.search(s)
+                if m:
+                    efm_path = profile_dir / "Files" / "S0" / "3" / "EFMData" / f"{m.group(1)}.dat"
+                    if efm_path.exists():
+                        if rid not in self._efm_by_rid:
+                            self._efm_by_rid[rid] = []
+                        if efm_path not in self._efm_by_rid[rid]:
+                            self._efm_by_rid[rid].append(efm_path)
 
         self._built = True
 
@@ -162,7 +179,8 @@ class BodyIndex:
         Tries in order:
         1. Inline HTML body in this record
         2. HTML body from a sibling record (same message-ID)
-        3. Body preview text from UTF-16LE strings
+        3. EFMData gzip file on disk (referenced by record or sibling)
+        4. Body preview text from UTF-16LE strings
         """
         self.build()
 
@@ -182,7 +200,8 @@ class BodyIndex:
                     source="inline",
                 )
 
-        # 2. Sibling via message-ID
+        # 2. Sibling via message-ID (check inline HTML and EFMData)
+        sibling_rid = None
         for s in utf16:
             if s.startswith("<") and "@" in s and s.endswith(">"):
                 if s in self._html_by_msgid:
@@ -196,7 +215,29 @@ class BodyIndex:
                             source="sibling",
                         )
 
-        # 3. Body preview
+        # 3. EFMData gzip files (on this record or sibling)
+        efm_rids = [record_id]
+        if sibling_rid and sibling_rid != record_id:
+            efm_rids.append(sibling_rid)
+        # Also check all records with same message-ID
+        for s in utf16:
+            if s.startswith("<") and "@" in s and s.endswith(">"):
+                for rid2, (ft2, _, utf16_2) in self._all_records.items():
+                    if rid2 not in efm_rids and s in utf16_2:
+                        efm_rids.append(rid2)
+
+        for rid in efm_rids:
+            if rid in self._efm_by_rid:
+                html = self._read_efm_body(self._efm_by_rid[rid][0])
+                if html:
+                    return EmailBody(
+                        record_id=rid,
+                        html=html,
+                        text=html_to_text(html),
+                        source="efmdata",
+                    )
+
+        # 4. Body preview
         preview = extract_body_preview(utf16, raw_ft)
         if preview:
             return EmailBody(
@@ -206,6 +247,19 @@ class BodyIndex:
                 source="preview",
             )
 
+        return None
+
+    @staticmethod
+    def _read_efm_body(path: Path) -> str | None:
+        """Read and decompress an EFMData gzip file."""
+        try:
+            with gzip.open(path, "rb") as f:
+                data = f.read()
+            html = data.decode("utf-8", errors="replace")
+            if "<html" in html.lower():
+                return html
+        except Exception:
+            pass
         return None
 
     def iter_bodies(self) -> Iterator[tuple[int, EmailBody]]:
