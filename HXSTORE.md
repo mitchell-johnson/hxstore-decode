@@ -166,6 +166,8 @@ Page (4096 bytes = 8 x 512-byte slots)
 
 Not all slots contain valid records. Empty slots have zeroed store_id or non-matching type fields.
 
+**Note:** Data records can also appear on index pages — the slot layout is shared. See [Section 11](#11-index-pages-b-tree--cola) for details.
+
 ### Slot Header (32 bytes)
 
 Each 512-byte slot begins with a 32-byte header:
@@ -371,6 +373,25 @@ Contains structured metadata extracted from emails: URLs, anchor text, link dest
 
 These contain full HTML email bodies and are approximately 90% readable text after decompression. Structure is similar to 0x03B0 but with larger HTML payloads.
 
+### Two-Object Model (MessageHeader + MessageData)
+
+Outlook stores emails as two separate Cola objects:
+
+| Object | Type ID | Contents |
+|--------|---------|----------|
+| **MessageHeader** | 201 | Subject, sender, date, flags, preview, read status, size, serverId |
+| **MessageData** | (separate) | `_messageDataHTMLBodyBytes`, `_body`, `_bodyEncoding`, `_bodyType` |
+
+The MessageHeader links to its MessageData via a `_messageDataId` property. In decompressed 0x10013 records, this property has been observed at byte offsets 632, 652, and 848.
+
+**Three-tier body storage:**
+
+| Tier | Condition | Storage Location |
+|------|-----------|-----------------|
+| Inline | Small bodies | Directly in the MessageData record |
+| Object stream | Medium bodies | Key-value store (blob pages) |
+| External file | Large bodies (68--152 KB HTML) | `~/Files/S0/3/EFMData/N.dat` (gzip-compressed) |
+
 ---
 
 ## 9. Attachment Storage
@@ -391,7 +412,7 @@ Records within HxStore reference attachments via paths like:
 ~/Files/S0/3/Attachments/0/<filename>[<id>].<ext>
 ```
 
-Additionally, **EFMData/*.dat** files store email body data for large emails that exceed inline storage limits.
+Additionally, **EFMData/*.dat** files store **gzip-compressed HTML email bodies** for large emails that exceed inline storage limits. These files decompress to 68--152 KB of full HTML. Records reference them via paths like `~/Files/S0/3/EFMData/N.dat`.
 
 A typical Outlook profile contains 300--400 attachment files.
 
@@ -477,8 +498,8 @@ Starting at offset 0x20 within the slot, entries are packed sequentially:
 |--------|------|------|-------------|
 | 0x00 | 4 | uint32_le | Key (sorted ascending within node) |
 | 0x04 | 4 | uint32_le | Type (always 8) |
-| 0x08 | 4 | uint32_le | val1 — typically points to blob pages |
-| 0x0C | 4 | uint32_le | val2 — matches record IDs at ~39% |
+| 0x08 | 4 | uint32_le | cumulative_size_a — subtree size statistic (NOT a blob page pointer; correlates with size_a at 69%) |
+| 0x0C | 4 | uint32_le | cumulative_size_b — subtree size statistic (matches record IDs at 39%) |
 | 0x10 | 4 | uint32_le | Reserved (always 0) |
 
 ### B-tree Structure
@@ -491,7 +512,7 @@ Starting at offset 0x20 within the slot, entries are packed sequentially:
 | Level 1 (leaf) | val1 may reference child index pages |
 | Level 2 (internal) | Contains range keys for subtree navigation |
 
-The val1/val2 fields encode cumulative subtree size information rather than direct page pointers. The tree navigation mechanism uses range-based key comparison rather than explicit child page pointers. Full traversal is not yet implemented.
+Entry fields are `[key, type=8, cumulative_size_a, cumulative_size_b, 0]` — these encode **subtree statistics** rather than direct page pointers. The `cumulative_size_a` field correlates with record `size_a` values at 69%, confirming it tracks aggregate compressed sizes. The tree navigation mechanism uses range-based key comparison rather than explicit child page pointers. Full traversal is not yet implemented.
 
 ### Statistics
 
@@ -565,11 +586,11 @@ The property format has not been fully decoded. Current extraction relies on heu
 | Property | Value |
 |----------|-------|
 | Location | `<Profile>/hxcore.hfl` |
-| Format | **NOT a Nostromoi database** |
+| Format | **Binary log format** (not Nostromoi) |
 | Typical size | ~50 MB |
 | Purpose | Binary log or auxiliary index for HxCore |
 
-The file does not begin with the Nostromoi magic. First 8 bytes: `08 00 00 00 00 00 01 00`. Contains version strings (e.g., `16.0.19819.33806`) and a DEADBEEF marker, but uses a completely different internal format from HxStore.hxd.
+The file does not begin with the Nostromoi magic. First 8 bytes: `08 00 00 00 00 00 01 00`. Binary log format — contains version strings (e.g., `16.0.19819.33806`) and a DEADBEEF marker, but uses a completely different internal structure from HxStore.hxd.
 
 ### Outlook.sqlite
 
@@ -619,6 +640,36 @@ The HxCore binary contains an extensive `Hx::Storage::Cola` namespace implementi
 | `Cola::PersistenceGroup` | Persistence / transaction groups |
 | `Cola::KvStoreReader` | Key-value store reader |
 | `Cola::GlobalLRUEvictor` | LRU eviction policy |
+
+### Object Type System
+
+Cola objects are typed by integer IDs. The following types have been identified:
+
+| ObjectType | Value | Description |
+|------------|-------|-------------|
+| Account | 73 | Email account |
+| View | 77 | Mail folder/view |
+| Calendar | 104 | Calendar |
+| Appointment | 107 | Calendar item |
+| MessageHeader | 201 | Email metadata |
+| DataReplication | 202 | Sync data |
+| AttachmentHeader | 212 | Attachment metadata |
+| Contact | 224 | Contact |
+| SearchSession | 288 | Search |
+| Person | 359 | Person record |
+
+**Key relationships:** A MessageHeader has children (Recipients, CcRecipients, BccRecipients, AttachmentHeaders) and links to a MessageData object via `_messageDataId`.
+
+### Storage Layers
+
+Cola sits on a **KeyValueStore** layer comprising:
+
+| Component | Purpose |
+|-----------|---------|
+| `KeyValueBlock` | Fixed-size storage blocks |
+| `KeyDirectory` | Key-to-block mapping |
+| `Blob` | Large value storage |
+| `Transaction` | ACID transaction support |
 
 ### Compression Symbols
 
@@ -694,11 +745,12 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 
 ### What Does Not Work (Yet)
 
+**Body resolution** now works for **59% of emails** via 5 tiers (inline record, blob page, object stream, EFMData .dat file, and heuristic HTML scan). The remaining ~40% are **un-synced bodies** (confirmed by the `_bodyDownloadStatus` property indicating the body was never downloaded from the server).
+
 | Gap | Description |
 |-----|-------------|
 | Structured property decoding | The property format within decompressed records is not decoded as structured TLV. Relies on heuristic regex extraction. |
 | Folder/label mapping | No known way to determine which folder a record belongs to. |
-| Read/unread status | Not identified in the record data. |
 | Attachment-to-record association | Attachments exist on the filesystem but cannot be programmatically linked to their parent records. |
 | Index page traversal | B-tree index pages are identified but not parsed; lookups require full sequential scan. |
 | Calendar event fields | Start/end times, location, attendees are not mapped. |
@@ -722,6 +774,8 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 6. **Compaction/WAL analysis**: The file may have write-ahead log mechanics. Observing the file across multiple sync cycles could reveal these patterns.
 
 7. **Dynamic analysis**: Using LLDB or Frida to hook `Hx::Compressor::CopyStreamToCompressed_LZ4` and `Cola::StoreObject` methods at runtime could reveal the exact serialization format used when writing records.
+
+8. **Property offset mapping via `_messageDataId`**: The `_messageDataId` field appears at known offsets (632, 652, 848) in decompressed 0x10013 records. Cross-referencing these positions with other known field values (subject, sender, dates) across many records could build a proper property offset map, replacing heuristic extraction with structured field decoding.
 
 ---
 
