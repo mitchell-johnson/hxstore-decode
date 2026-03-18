@@ -26,6 +26,7 @@ from hxdecode.extract import (
     extract_ascii_strings,
     extract_emails,
     extract_record_id,
+    extract_display_time,
     extract_timestamps,
     extract_utf16le_strings,
 )
@@ -190,7 +191,7 @@ def _decompress_and_extract(rec) -> dict[str, Any]:
         "emails": all_emails,
         "utf16_strings": utf16,
         "timestamps": timestamps,
-        "timestamp": timestamps[0] if timestamps else None,
+        "timestamp": extract_display_time(decompressed),
         "decompressed": decompressed,
         "raw_data": rec.raw_data,
     }

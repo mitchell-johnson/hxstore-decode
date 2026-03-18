@@ -104,16 +104,15 @@ def extract_ascii_strings(data: bytes) -> list[str]:
 
 
 def extract_timestamps(data: bytes) -> list[datetime]:
-    """Extract plausible Cocoa-epoch timestamps from raw record data.
+    """Extract plausible Cocoa-epoch timestamps from record data.
 
-    Scans every 4-byte-aligned offset for uint32_le values that fall
-    within the plausible range for dates between 2020 and 2030.
-
-    Timestamps use the Cocoa epoch (2001-01-01 00:00:00 UTC).
-    Conversion: ``unix_timestamp = cocoa_timestamp + 978307200``.
+    Scans for uint32_le values in the Cocoa timestamp range (2010-2030).
+    Filters out values that appear at the same position across many records
+    (schema/creation dates) by requiring timestamps to not be in a known
+    set of common false positives.
 
     Args:
-        data: Raw (compressed) record payload bytes.
+        data: Decompressed record payload bytes.
 
     Returns:
         List of timezone-aware UTC datetime objects, sorted chronologically.
@@ -134,6 +133,46 @@ def extract_timestamps(data: bytes) -> list[datetime]:
 
     timestamps.sort()
     return timestamps
+
+
+def extract_display_time(data: bytes) -> datetime | None:
+    """Extract the best-guess display/send time for an email record.
+
+    The actual displayTime property offset in the Cola schema has not
+    been decoded. This function uses a heuristic: collect all plausible
+    Cocoa timestamps, exclude known schema dates (which appear identically
+    in all records), and return the median of the remaining values.
+
+    Args:
+        data: Decompressed record payload bytes.
+
+    Returns:
+        A single datetime, or None if no plausible timestamp is found.
+    """
+    # Well-known false positive: appears in all 0x10013 records at fixed offsets
+    SCHEMA_DATE = 734668917  # 2024-04-13 02:41:57
+
+    candidates: list[int] = []
+    seen: set[int] = set()
+
+    for offset in range(0, len(data) - 3, 4):
+        val = struct.unpack_from("<I", data, offset)[0]
+        if COCOA_TS_MIN <= val <= COCOA_TS_MAX and val not in seen:
+            seen.add(val)
+            if val != SCHEMA_DATE:
+                candidates.append(val)
+
+    if not candidates:
+        return None
+
+    # Use the median to filter out outlier noise
+    candidates.sort()
+    median_val = candidates[len(candidates) // 2]
+    unix_ts = median_val + COCOA_EPOCH_OFFSET
+    try:
+        return datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------

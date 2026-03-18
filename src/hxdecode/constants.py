@@ -31,8 +31,8 @@ HEADER_TOTAL_SIZE_OFFSET = 0x10
 HEADER_BITMAP_OFFSET = 0x18
 HEADER_DATA_OFFSET = 0x20
 
-# Plausible Cocoa timestamp range (approx 2020-01-01 to 2030-01-01)
-COCOA_TS_MIN = 599_616_000   # 2020-01-01
+# Plausible Cocoa timestamp range (approx 2010-01-01 to 2030-01-01)
+COCOA_TS_MIN = 284_083_200   # 2010-01-01
 COCOA_TS_MAX = 915_148_800   # 2030-01-01
 
 # Known record format types
