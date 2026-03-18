@@ -32,6 +32,7 @@ from hxdecode.extract import (
     extract_utf16le_strings,
     _TEXT_EMAIL_RE as _EMAIL_RE_TEXT,
 )
+from hxdecode.folder import FolderIndex
 from hxdecode.formatters import (
     format_csv,
     format_json,
@@ -196,10 +197,20 @@ def info(path: str | None) -> None:
     "--sort", "sort_order", type=click.Choice(["newest", "oldest", "none"]),
     default="newest", show_default=True, help="Sort by timestamp.",
 )
+@click.option("--folder", default=None, help="Filter by folder name (case-insensitive substring).")
+@click.option(
+    "--direction", type=click.Choice(["sent", "received"]),
+    default=None, help="Filter by mail direction.",
+)
 @click.option("--path", default=None, type=click.Path(), help="Path to HxStore.hxd file.")
 @click.pass_context
-def mail(ctx: click.Context, limit: int, fmt: str, sort_order: str, path: str | None) -> None:
-    """List email records with sender, subject, and date."""
+def mail(ctx: click.Context, limit: int, fmt: str, sort_order: str,
+         folder: str | None, direction: str | None, path: str | None) -> None:
+    """List email records with sender, subject, and date.
+
+    Use --folder to filter by folder name (e.g. --folder inbox) or
+    --direction to show only sent or received mail.
+    """
     ctx.ensure_object(dict)
     ctx.obj["path"] = path
 
@@ -207,7 +218,9 @@ def mail(ctx: click.Context, limit: int, fmt: str, sort_order: str, path: str | 
         return
 
     store = _open_store(path)
-    columns = ["record_id", "sender_email", "sender_name", "subject", "timestamp"]
+    folder_index = FolderIndex(store)
+
+    columns = ["record_id", "folder", "sender_email", "sender_name", "subject", "timestamp"]
     rows: list[dict[str, Any]] = []
 
     # When sorting, we need to scan all email records first, then limit.
@@ -222,6 +235,22 @@ def mail(ctx: click.Context, limit: int, fmt: str, sort_order: str, path: str | 
         # Filter to email records (contain IPM.Note marker)
         if not info["is_email"]:
             continue
+
+        # Resolve folder membership
+        folder_name = folder_index.get_folder(info["decompressed"]) or ""
+        info["folder"] = folder_name
+
+        # Apply folder filter
+        if folder and folder.lower() not in folder_name.lower():
+            continue
+
+        # Apply direction filter
+        if direction:
+            is_sent = folder_name.lower().startswith("sent")
+            if direction == "sent" and not is_sent:
+                continue
+            if direction == "received" and is_sent:
+                continue
 
         rows.append(info)
 
@@ -258,11 +287,13 @@ def mail(ctx: click.Context, limit: int, fmt: str, sort_order: str, path: str | 
 def mail_show(record_id: int, show_hex: bool, path: str | None) -> None:
     """Show full detail of a single record by ID."""
     store = _open_store(path)
+    folder_index = FolderIndex(store)
 
     for rec in store.iter_data_records():
         rid = extract_record_id(rec.raw_data)
         if rid == record_id:
             info = _decompress_and_extract(rec)
+            info["folder"] = folder_index.get_folder(info["decompressed"]) or ""
             # Remove large binary fields from detail view unless hex requested
             detail = {k: v for k, v in info.items() if k not in ("decompressed", "raw_data")}
             detail["emails"] = ", ".join(info["emails"])
@@ -305,6 +336,55 @@ def mail_body(record_id: int, show_html: bool, path: str | None) -> None:
         click.echo(body.html)
     else:
         click.echo(body.text)
+
+
+# ---------------------------------------------------------------------------
+# folders
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--path", default=None, type=click.Path(), help="Path to HxStore.hxd file.")
+@click.option(
+    "--format", "fmt", type=click.Choice(["table", "json", "csv"]),
+    default="table", show_default=True, help="Output format.",
+)
+def folders(path: str | None, fmt: str) -> None:
+    """List all mail folders found in the database."""
+    store = _open_store(path)
+    folder_index = FolderIndex(store)
+
+    if not folder_index.folders:
+        click.echo("No folders found.")
+        return
+
+    # Count emails per folder
+    from collections import Counter
+
+    folder_counts: Counter[str] = Counter()
+    for rec in store.iter_data_records():
+        info = _decompress_and_extract(rec)
+        if not info["is_email"]:
+            continue
+        name = folder_index.get_folder(info["decompressed"])
+        if name:
+            folder_counts[name] += 1
+
+    columns = ["folder", "emails"]
+    rows = [
+        {"folder": name, "emails": folder_counts.get(name, 0)}
+        for _ref, name in sorted(folder_index.folders.items(), key=lambda x: -folder_counts.get(x[1], 0))
+    ]
+    # Deduplicate folder names (multiple refs can map to same name)
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for r in rows:
+        if r["folder"] not in seen:
+            seen.add(r["folder"])
+            deduped.append(r)
+
+    _output(deduped, columns, fmt)
+    click.echo(f"\n{len(deduped)} folder(s) found.")
 
 
 # ---------------------------------------------------------------------------

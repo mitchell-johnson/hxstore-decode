@@ -260,7 +260,7 @@ The first 4 bytes of the LZ4 compressed stream (i.e., the uint32_le at `record_d
 | 0x03B1 | 945 | **Email records** (variant) | Email records, similar structure to 0x03B0 |
 | 0x10013 | 65,555 | **Mixed records** | 41% emails, 59% metadata/folders/settings |
 | 0x0191 | 401 | **Email summary records** | 48% contain IPM.Note. Sender, subject, body preview. |
-| 0x0190 | 400 | **Entity extraction data** | URLs, anchor text, structured metadata extracted from emails. JSON-like content. |
+| 0x0190 | 400 | **Entity/container records** | Mixed: entity extraction data (URLs, metadata) AND large account container records with folder definitions. Small records (~1-8 KB) contain JSON-like entity data. Large records (~50-100 KB) contain the complete folder hierarchy with name tables. |
 | 0x310F4 | 200,948 | **Rich email records** | Full HTML bodies, ~90% readable content |
 | 0x30FF1 | 200,689 | **Rich email records** | Full HTML bodies, ~90% readable content |
 | 0x0150 | 336 | **Small metadata records** | ~6% readable, compact binary metadata |
@@ -353,6 +353,54 @@ subject               (repeated)
 
 The remaining 59% contain folder metadata, settings, and configuration data without the IPM.Note marker.
 
+##### 0x10013 Record Header (Decoded)
+
+All 0x10013 records share a common 64-byte header:
+
+| Offset | Size | Type | Description |
+|--------|------|------|-------------|
+| 0-7 | 8 | bytes | Zeros |
+| 8 | 4 | uint32_le | Entry count (1-10) |
+| 12 | 4 | uint32_le | Total size |
+| 16 | 2 | uint16_le | Constant `0x0006` |
+| 18 | 2 | uint16_le | Constant `0x0570` (Cola store tag) |
+| 20 | 4 | uint32_le | Self-referencing record ID (100% confirmed) |
+| 28 | 2 | uint16_le | Near ObjectType (0x00C7=199 for emails, close to MessageHeader=201) |
+| 34 | 2 | uint16_le | Sub-type tag: `0x0290` (emails + some metadata), `0x01F0` (skeleton objects), `0x00D0`/`0x0070` (small metadata) |
+| 44 | 2 | uint16_le | **ObjectType** (see below) |
+| 48 | 4 | uint32_le | Account root record ID |
+
+##### ObjectType at Offset 44
+
+The uint16 at offset 44 in decompressed 0x10013 records classifies the record:
+
+| ObjectType | Value | Description | Count (typical) |
+|------------|-------|-------------|-----------------|
+| Email (MessageHeader) | 0xBF (191) | Email record | ~864 |
+| Folder (View) | 0x4D (77) | Mail folder definition | ~45 |
+| Contact | 0xE0 (224) | Contact record | ~26 |
+| Calendar | 0x68 (104) | Calendar item | ~6 |
+| Search | 0x120 (288) | Search session | ~38 |
+
+##### Schema Table (Bytes 64-532)
+
+The 475 bytes from offset 64 to 532 are a **fixed schema table** that is 100% identical across all email records. It contains property definition entries in a 10-byte format: `[uint32 property_id][uint32 type=3][uint16 padding=0]`, with 4-byte sequence counters separating groups.
+
+##### Section Marker Structure
+
+After the schema table and a variable footer, section markers (`00 01 00 00 00 00 01`) divide the record into property groups. Each section begins with a 16-byte header:
+
+| Offset | Size | Type | Description |
+|--------|------|------|-------------|
+| 0 | 4 | uint32_le | Section data length |
+| 4 | 2 | uint16_le | Constant `0x0005` |
+| 6 | 2 | uint16_le | Format subtype (e.g. `0x0613` for email) |
+| 8 | 4 | uint32_le | Section data length (repeated) |
+| 12 | 2 | uint16_le | Padding |
+| 14 | 2 | uint16_le | Object type (e.g. `0x00C9`=201 for MessageHeader) |
+
+Records may contain multiple sections for child objects (Recipients, AttachmentHeaders).
+
 #### Format 0x0191 (Email Summary Records)
 
 ```
@@ -392,6 +440,65 @@ The MessageHeader links to its MessageData via a `_messageDataId` property. In d
 | Inline | Small bodies | Directly in the MessageData record |
 | Object stream | Medium bodies | Key-value store (blob pages) |
 | External file | Large bodies (68--152 KB HTML) | `~/Files/S0/3/EFMData/N.dat` (gzip-compressed) |
+
+### Folder/Mailbox Mapping
+
+Email-to-folder membership is now fully decoded for `0x10013` records.
+
+#### Folder Reference in Email Records
+
+Each email record (0x10013, ObjectType 0xBF at offset 44) contains a **16-byte folder reference pattern** at fixed offset **1520** in the decompressed data:
+
+```
+Offset 1520:
+  [uint32 folder_ref_id]   -- identifies the containing folder
+  [uint32 0x00000000]      -- zero padding
+  [uint32 0x00000002]      -- constant
+  [uint32 account_root_id] -- account container record ID
+```
+
+This pattern resolves **100% of standard email records** (863/864 in a typical database). The single exception is a folder record (ObjectType 0x4D) that coincidentally contains email-like content.
+
+#### Folder Name Table (Container Records)
+
+Folder names are stored in **large 0x0190 container records** (typically 50-100 KB). These records contain the complete folder hierarchy with paired entries in a linked-list structure.
+
+The container record uses the same `[ref_id, 0, 2, root_id]` pattern to define folder entries. Each folder appears as two consecutive entries: the first entry's ref_id is the folder's own identifier, and the second entry's ref_id is the next folder's identifier (linked-list forward pointer).
+
+Folder names appear as UTF-16LE strings within each entry, positioned before the ref_id pattern. The `05 00 4D 04` byte sequence acts as a separator between catalog entries, though the catalog keys after this separator are B-tree internal identifiers rather than the folder ref_ids used in email records.
+
+#### Extraction Algorithm
+
+1. Find large 0x0190 container records (>10 KB)
+2. The container's own record ID is the account root ID
+3. Search for all `[ref_id, 00000000, 02000000, root_id]` patterns
+4. For each pattern, find the first UTF-16LE string within 200 bytes before it
+5. Allow overwrites (last mapping wins) to handle the linked-list paired structure
+6. For email records, read uint32 at offset 1520 as the folder ref_id
+
+#### Example Folder Map
+
+| ref_id | Folder Name | Emails |
+|--------|-------------|--------|
+| 1182 | Inbox | 304 |
+| 1636 | Sent Mail | 208 |
+| 4558 | m.johnson@massey.ac.nz | 123 |
+| 4569 | elwesties@gmail.com | 97 |
+| 4580 | Uni Mass email shit | 93 |
+| 1658 | Spam | 15 |
+| 1204 | Drafts | 4 |
+| 1669 | Archive | 0 |
+| 1647 | Trash | 0 |
+| 4602 | Call For Papers | 0 |
+| 2145 | Conversation History | 0 |
+| 4591 | UNI | 0 |
+
+#### Key Findings
+
+- **MAPI property tags are NOT used** for folder linkage. `PidTagParentFolderId` (0x6749) and `PidTagFolderId` (0x6748) do not appear in Cola records. The Cola engine uses its own record-ID reference system.
+- **IPF.Note** (folder container class, distinct from IPM.Note message class) was not found in folder records. Folder records are identified by ObjectType 0x4D at offset 44.
+- The folder reference at offset 1520 enables **incoming vs outgoing mail filtering**: emails in "Sent Mail" folders are outgoing, all others are incoming.
+- Multiple email accounts share a single HxStore file. Each account has its own container record with a distinct root_id.
 
 ---
 
@@ -759,6 +866,9 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 - **Record enumeration**, ID-based lookup, and format type classification
 - **Blob page decompression** for type-4 (LZ4) blob pages (99.5% success with standard library)
 - **Record format type classification** distinguishing emails, metadata, entities, and rich content
+- **Folder/mailbox mapping** -- 100% resolution of email-to-folder membership via 16-byte reference pattern at offset 1520 in 0x10013 records. 12 folders discovered including Inbox, Sent Mail, Drafts, Spam, Archive, Trash, and custom folders.
+- **ObjectType classification** -- uint16 at offset 44 in 0x10013 records distinguishes emails (0xBF), folders (0x4D), contacts (0xE0), calendar items (0x68), and search sessions (0x120)
+- **Incoming/outgoing mail filtering** -- folder membership enables direction-based filtering (Sent Mail = outgoing, all others = incoming)
 
 ### What Does Not Work (Yet)
 
@@ -767,7 +877,7 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 | Gap | Description |
 |-----|-------------|
 | Structured property decoding | The property format within decompressed records is not decoded as structured TLV. Relies on heuristic regex extraction. |
-| Folder/label mapping | No known way to determine which folder a record belongs to. |
+| ~~Folder/label mapping~~ | **SOLVED** -- see [Folder/Mailbox Mapping](#foldermailbox-mapping). 100% resolution via 16-byte reference pattern at offset 1520. |
 | Attachment-to-record association | Attachments exist on the filesystem but cannot be programmatically linked to their parent records. |
 | Index page traversal | B-tree index pages are identified but not parsed; lookups require full sequential scan. |
 | Calendar event fields | Start/end times, location, attendees are not mapped. |
