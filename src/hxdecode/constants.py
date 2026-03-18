@@ -35,6 +35,30 @@ HEADER_DATA_OFFSET = 0x20
 COCOA_TS_MIN = 284_083_200   # 2010-01-01
 COCOA_TS_MAX = 915_148_800   # 2030-01-01
 
+# ---------------------------------------------------------------------------
+# .NET ticks timestamp constants
+# ---------------------------------------------------------------------------
+
+# 100-nanosecond intervals per second (C# DateTime.Ticks resolution)
+DOTNET_TICKS_PER_SECOND = 10_000_000
+
+# Sentinel value that brackets the displayTime in the 48-byte timestamp block.
+# Structure: [8B sync_time] [8B sentinel] [8B displayTime] [8B sentinel] ...
+DOTNET_SENTINEL = b"\xff\x3f\x37\xf4\x75\x28\xca\x2b"
+
+# Plausible .NET ticks range: 2010-01-01 to 2030-01-01
+DOTNET_TICKS_MIN = 633_979_008_000_000_000  # 2010-01-01
+DOTNET_TICKS_MAX = 642_297_024_000_000_000  # 2030-01-01
+
+# ---------------------------------------------------------------------------
+# _messageDataId offsets in decompressed 0x10013 records
+# ---------------------------------------------------------------------------
+
+MSG_DATA_ID_OFFSETS = (632, 652, 848)
+
+# ---------------------------------------------------------------------------
 # Known record format types
+# ---------------------------------------------------------------------------
+
 FORMAT_TYPE_A = 0x03B0    # 944 - mail records, calendar items
 FORMAT_TYPE_B = 0x10013   # 65555 - metadata, folder entries, contacts

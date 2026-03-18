@@ -24,11 +24,13 @@ from hxdecode.constants import PAGE_SIZE
 from hxdecode.decompress import decompress_record
 from hxdecode.extract import (
     extract_ascii_strings,
+    extract_email_fields,
     extract_emails,
     extract_record_id,
     extract_display_time,
     extract_timestamps,
     extract_utf16le_strings,
+    _TEXT_EMAIL_RE as _EMAIL_RE_TEXT,
 )
 from hxdecode.formatters import (
     format_csv,
@@ -79,8 +81,6 @@ def _output(records: list[dict[str, Any]], columns: list[str], fmt: str) -> None
 
 def _decompress_and_extract(rec) -> dict[str, Any]:
     """Decompress a RawRecord and extract all fields."""
-    import re
-
     rec_id, decompressed = decompress_record(
         rec.raw_data, rec.slot_header.size_b
     )
@@ -95,85 +95,20 @@ def _decompress_and_extract(rec) -> dict[str, Any]:
     utf16 = extract_utf16le_strings(decompressed)
     timestamps = extract_timestamps(decompressed)
 
-    # Also extract emails from UTF-16LE strings
+    # Also extract emails from UTF-16LE strings (module-level regex)
     all_emails: list[str] = list(ascii_emails)
     seen = set(e.lower() for e in all_emails)
-    email_re = re.compile(r"[\w.+-]+@[\w.]+\.\w{2,6}")
     for s in utf16:
-        for m in email_re.finditer(s):
+        for m in _EMAIL_RE_TEXT.finditer(s):
             addr = m.group().lower()
             if addr not in seen:
                 seen.add(addr)
                 all_emails.append(m.group())
 
     is_email = "IPM.Note" in utf16
-    skip_strs = {"IPM.Note", "Standard", "Normal"}
 
-    sender_email = ""
-    sender_name = ""
-    subject = ""
-
-    def _extract_subject_from_sequence(strings: list[str]) -> str:
-        """Extract subject from: msg_ids... → body_preview → subject."""
-        # Skip message-IDs (start with <, contain @)
-        pos = 0
-        for s in strings:
-            if s.startswith("<") and "@" in s:
-                pos += 1
-            else:
-                break
-        remaining = strings[pos:]
-        # Next is body_preview, then subject
-        if len(remaining) >= 2:
-            return remaining[1]
-        elif len(remaining) == 1:
-            return remaining[0]
-        return ""
-
-    if is_email and utf16:
-        ipm_idx = utf16.index("IPM.Note")
-        after_ipm = utf16[ipm_idx + 1:]
-
-        if raw_fmt in (0x03B0, 0x03B1):
-            # 0x03B0 pattern: IPM.Note → sender_email → sender_name → [recip_email → recip_name]* →
-            #   IPM.Note → msg_ids → body_preview → subject → empty → combined_preview
-            for s in after_ipm:
-                if s in skip_strs:
-                    break
-                if not sender_email and email_re.fullmatch(s):
-                    sender_email = s
-                elif sender_email and not sender_name and "@" not in s and "<" not in s:
-                    sender_name = s
-                    break
-
-            # Find 2nd IPM.Note for subject
-            ipm_positions = [i for i, s in enumerate(utf16) if s == "IPM.Note"]
-            if len(ipm_positions) >= 2:
-                after_ipm2 = utf16[ipm_positions[1] + 1:]
-                subject = _extract_subject_from_sequence(after_ipm2)
-        elif raw_fmt == 0x0191:
-            # 0x0191 pattern: IPM.Note → sender_email → sender_email_repeat → body_preview →
-            #   sender_name_combined → subject → subject_repeat → IPM.Note...
-            if len(after_ipm) >= 1 and email_re.fullmatch(after_ipm[0]):
-                sender_email = after_ipm[0]
-            if len(after_ipm) >= 4:
-                sender_name = after_ipm[3]  # combined sender + app name
-                subject = after_ipm[4] if len(after_ipm) >= 5 else ""
-        else:
-            # 0x10013 and others: IPM.Note → msg_ids → body_preview → subject
-            subject = _extract_subject_from_sequence(after_ipm)
-
-            # For non-0x03B0, sender info may appear later
-            for s in utf16:
-                if s in skip_strs or s == subject:
-                    continue
-                if s.startswith("<"):
-                    continue
-                if email_re.fullmatch(s) and not sender_email:
-                    sender_email = s
-                elif sender_email and not sender_name and "@" not in s and "<" not in s and len(s) >= 2:
-                    sender_name = s
-                    break
+    # Use the centralised field extractor
+    sender_email, sender_name, subject = extract_email_fields(utf16, raw_fmt)
 
     if not sender_email and all_emails:
         sender_email = all_emails[0]
@@ -257,9 +192,13 @@ def info(path: str | None) -> None:
     "--format", "fmt", type=click.Choice(["table", "json", "csv"]),
     default="table", show_default=True, help="Output format.",
 )
+@click.option(
+    "--sort", "sort_order", type=click.Choice(["newest", "oldest", "none"]),
+    default="newest", show_default=True, help="Sort by timestamp.",
+)
 @click.option("--path", default=None, type=click.Path(), help="Path to HxStore.hxd file.")
 @click.pass_context
-def mail(ctx: click.Context, limit: int, fmt: str, path: str | None) -> None:
+def mail(ctx: click.Context, limit: int, fmt: str, sort_order: str, path: str | None) -> None:
     """List email records with sender, subject, and date."""
     ctx.ensure_object(dict)
     ctx.obj["path"] = path
@@ -271,8 +210,11 @@ def mail(ctx: click.Context, limit: int, fmt: str, path: str | None) -> None:
     columns = ["record_id", "sender_email", "sender_name", "subject", "timestamp"]
     rows: list[dict[str, Any]] = []
 
+    # When sorting, we need to scan all email records first, then limit.
+    scan_limit = limit if sort_order == "none" else 0  # 0 = unlimited scan
+
     for rec in store.iter_data_records():
-        if len(rows) >= limit:
+        if scan_limit and len(rows) >= scan_limit:
             break
 
         info = _decompress_and_extract(rec)
@@ -286,6 +228,24 @@ def mail(ctx: click.Context, limit: int, fmt: str, path: str | None) -> None:
     if not rows:
         click.echo("No email records found.")
         return
+
+    # Sort by timestamp if requested
+    if sort_order in ("newest", "oldest"):
+        from datetime import datetime as _dt
+        _epoch = _dt.min.replace(tzinfo=None)
+
+        def _sort_key(row: dict[str, Any]) -> _dt:
+            ts = row.get("timestamp")
+            if ts is None:
+                return _epoch
+            # Strip tzinfo for comparison consistency
+            return ts.replace(tzinfo=None) if hasattr(ts, "replace") else _epoch
+
+        rows.sort(key=_sort_key, reverse=(sort_order == "newest"))
+
+    # Apply limit after sorting
+    if sort_order != "none" and len(rows) > limit:
+        rows = rows[:limit]
 
     _output(rows, columns, fmt)
     click.echo(f"\n{len(rows)} email(s) shown.")
@@ -492,7 +452,6 @@ def blob_search(query: str, path: str | None) -> None:
 @click.option("--path", default=None, type=click.Path(), help="Path to HxStore.hxd file.")
 def attachments(limit: int, fmt: str, path: str | None) -> None:
     """List email attachments with filenames and disk paths."""
-    import re
     store = _open_store(path)
 
     # Resolve the profile directory for attachment paths
@@ -515,12 +474,11 @@ def attachments(limit: int, fmt: str, path: str | None) -> None:
 
         # Get sender from the record
         raw_ft = struct.unpack_from("<I", rec.raw_data, 8)[0] if len(rec.raw_data) >= 12 else 0
-        email_re = re.compile(r"[\w.+-]+@[\w.]+\.\w{2,6}")
         sender = ""
         if "IPM.Note" in utf16 and raw_ft == 0x03B0:
             ipm_idx = utf16.index("IPM.Note")
             for s in utf16[ipm_idx + 1:]:
-                if email_re.fullmatch(s):
+                if _EMAIL_RE_TEXT.fullmatch(s):
                     sender = s
                     break
 

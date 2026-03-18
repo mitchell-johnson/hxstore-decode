@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from hxdecode.constants import MSG_DATA_ID_OFFSETS
 from hxdecode.decompress import decompress_record
 from hxdecode.extract import extract_utf16le_strings
 from hxdecode.parser import HxStoreFile, RawRecord
@@ -125,9 +126,6 @@ class BodyIndex:
     with HTML bodies, enabling cross-record body resolution.
     """
 
-    # Offsets in decompressed 0x10013 records where _messageDataId is stored
-    _MSG_DATA_ID_OFFSETS = (632, 652, 848)
-
     def __init__(self, store: HxStoreFile) -> None:
         self._store = store
         # message_id -> (record_id, decompressed_bytes)
@@ -138,6 +136,8 @@ class BodyIndex:
         self._all_records: dict[int, tuple[int, bytes, list[str]]] = {}
         # record_id -> list of EFMData file paths
         self._efm_by_rid: dict[int, list[Path]] = {}
+        # message_id -> list of record_ids (for fast sibling lookup)
+        self._rids_by_msgid: dict[str, list[int]] = {}
         self._built = False
 
     def build(self) -> None:
@@ -155,6 +155,14 @@ class BodyIndex:
             )
             utf16 = extract_utf16le_strings(decompressed)
             self._all_records[rid] = (raw_ft, decompressed, utf16)
+
+            # Index all message-IDs for fast sibling lookup
+            for s in utf16:
+                if s.startswith("<") and "@" in s and s.endswith(">"):
+                    if s not in self._rids_by_msgid:
+                        self._rids_by_msgid[s] = []
+                    if rid not in self._rids_by_msgid[s]:
+                        self._rids_by_msgid[s].append(rid)
 
             has_html = b"<html" in decompressed or b"<HTML" in decompressed
             if has_html and raw_ft in _HTML_FORMATS:
@@ -204,7 +212,7 @@ class BodyIndex:
                 )
 
         # 2a. _messageDataId link (0x10013 -> 0x03B0)
-        for offset in self._MSG_DATA_ID_OFFSETS:
+        for offset in MSG_DATA_ID_OFFSETS:
             if offset + 4 > len(decompressed):
                 continue
             data_id = struct.unpack_from("<I", decompressed, offset)[0]
@@ -237,11 +245,11 @@ class BodyIndex:
         efm_rids = [record_id]
         if sibling_rid and sibling_rid != record_id:
             efm_rids.append(sibling_rid)
-        # Also check all records with same message-ID
+        # Also check all records with same message-ID (using pre-built index)
         for s in utf16:
             if s.startswith("<") and "@" in s and s.endswith(">"):
-                for rid2, (ft2, _, utf16_2) in self._all_records.items():
-                    if rid2 not in efm_rids and s in utf16_2:
+                for rid2 in self._rids_by_msgid.get(s, ()):
+                    if rid2 not in efm_rids:
                         efm_rids.append(rid2)
 
         for rid in efm_rids:

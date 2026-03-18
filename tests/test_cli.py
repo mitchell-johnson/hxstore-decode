@@ -1,4 +1,4 @@
-"""Tests for hxdecode CLI structure and formatters.
+"""Tests for hxdecode CLI structure, formatters, and extract helpers.
 
 These tests validate that the CLI module loads correctly and that the
 formatters produce expected output, without requiring parser modules
@@ -13,6 +13,14 @@ import click.testing
 import pytest
 
 from hxdecode.cli import cli
+from hxdecode.constants import (
+    DOTNET_SENTINEL,
+    DOTNET_TICKS_MAX,
+    DOTNET_TICKS_MIN,
+    DOTNET_TICKS_PER_SECOND,
+    MSG_DATA_ID_OFFSETS,
+)
+from hxdecode.extract import extract_email_fields
 from hxdecode.formatters import (
     format_csv,
     format_json,
@@ -73,6 +81,7 @@ class TestCLIStructure:
         assert result.exit_code == 0
         assert "--limit" in result.output
         assert "--format" in result.output
+        assert "--sort" in result.output
 
     def test_mail_show_help(self) -> None:
         runner = click.testing.CliRunner()
@@ -247,3 +256,98 @@ class TestFormatRecordDetail:
         result = format_record_detail(record)
         # Should not crash; None renders as empty.
         assert "Record Id" in result
+
+
+# ---------------------------------------------------------------------------
+# Constants tests
+# ---------------------------------------------------------------------------
+
+
+class TestConstants:
+    """Verify .NET ticks constants are correctly defined."""
+
+    def test_dotnet_sentinel_is_8_bytes(self) -> None:
+        assert len(DOTNET_SENTINEL) == 8
+
+    def test_dotnet_sentinel_value(self) -> None:
+        assert DOTNET_SENTINEL == b"\xff\x3f\x37\xf4\x75\x28\xca\x2b"
+
+    def test_ticks_per_second(self) -> None:
+        assert DOTNET_TICKS_PER_SECOND == 10_000_000
+
+    def test_ticks_range_order(self) -> None:
+        assert DOTNET_TICKS_MIN < DOTNET_TICKS_MAX
+
+    def test_msg_data_id_offsets_is_tuple(self) -> None:
+        assert isinstance(MSG_DATA_ID_OFFSETS, tuple)
+        assert len(MSG_DATA_ID_OFFSETS) == 3
+
+
+# ---------------------------------------------------------------------------
+# Email field extraction tests
+# ---------------------------------------------------------------------------
+
+
+class TestExtractEmailFields:
+    """Tests for the centralised extract_email_fields helper."""
+
+    def test_no_ipm_note_returns_empty(self) -> None:
+        result = extract_email_fields(["hello", "world"], 0x03B0)
+        assert result == ("", "", "")
+
+    def test_03b0_format_basic(self) -> None:
+        strings = [
+            "IPM.Note",
+            "sender@example.com",
+            "Jane Doe",
+            "IPM.Note",
+            "Re: Test Subject",
+        ]
+        sender_email, sender_name, subject = extract_email_fields(strings, 0x03B0)
+        assert sender_email == "sender@example.com"
+        assert sender_name == "Jane Doe"
+        assert subject == "Re: Test Subject"
+
+    def test_03b0_format_with_msgid(self) -> None:
+        strings = [
+            "IPM.Note",
+            "sender@example.com",
+            "Jane Doe",
+            "IPM.Note",
+            "<abc123@mail.example.com>",
+            "body preview here",
+            "Actual Subject",
+        ]
+        sender_email, sender_name, subject = extract_email_fields(strings, 0x03B0)
+        assert sender_email == "sender@example.com"
+        assert sender_name == "Jane Doe"
+        # After skipping message-IDs, body_preview is next, then subject
+        assert subject == "Actual Subject"
+
+    def test_0191_format(self) -> None:
+        strings = [
+            "IPM.Note",
+            "sender@example.com",
+            "sender@example.com",
+            "body preview",
+            "Sender Name",
+            "Test Subject",
+        ]
+        sender_email, sender_name, subject = extract_email_fields(strings, 0x0191)
+        assert sender_email == "sender@example.com"
+        assert sender_name == "Sender Name"
+        assert subject == "Test Subject"
+
+    def test_10013_format(self) -> None:
+        strings = [
+            "IPM.Note",
+            "<msg-id@example.com>",
+            "body preview text",
+            "The Subject Line",
+        ]
+        sender_email, sender_name, subject = extract_email_fields(strings, 0x10013)
+        assert subject == "The Subject Line"
+
+    def test_empty_strings_list(self) -> None:
+        result = extract_email_fields([], 0x03B0)
+        assert result == ("", "", "")

@@ -40,6 +40,7 @@ There is no public documentation of this format. Everything in this document was
 | Page size | 4096 bytes (0x1000) |
 | Typical file size | 50--300 MB |
 | Safe to read while Outlook is running | Yes (read-only) |
+| Timestamp encoding | .NET ticks (int64, 100ns since 0001-01-01) |
 
 ### File Location
 
@@ -551,25 +552,40 @@ Email records contain the string `IPM.Note` encoded as UTF-16LE. This is the MAP
 
 ### Timestamps
 
-Timestamps use the **Cocoa epoch**: seconds since **2001-01-01 00:00:00 UTC** (the standard `NSDate` reference date in Apple frameworks).
+Timestamps are stored as **.NET ticks** — `int64` little-endian values representing 100-nanosecond intervals since **0001-01-01 00:00:00 UTC**. This is the same encoding as C# `DateTime.Ticks`.
+
+**NOT** Cocoa epoch, **NOT** Unix epoch, **NOT** Windows FILETIME.
 
 | Property | Value |
 |----------|-------|
-| Encoding | uint32_le (4 bytes) |
-| Epoch | 2001-01-01 00:00:00 UTC |
-| Offset to Unix epoch | +978,307,200 seconds |
-| Plausible range (2020--2030) | 599,616,000 -- 915,148,800 |
+| Encoding | int64_le (8 bytes) |
+| Epoch | 0001-01-01 00:00:00 UTC |
+| Unit | 100-nanosecond intervals (10,000,000 per second) |
+| Precision | Whole seconds (sub-second remainder is always 0) |
+| Extraction rate | 100% across all 669 email records |
+
+Timestamps are embedded in a **48-byte sentinel block** within the decompressed record:
+
+```
++0x00  8B  Sync/modification timestamp (.NET ticks)
++0x08  8B  Sentinel: FF 3F 37 F4 75 28 CA 2B
++0x10  8B  displayTime (.NET ticks) — the email send date
++0x18  8B  Sentinel (repeated)
++0x20  8B  Sentinel (repeated)
++0x28  8B  Sentinel (repeated)
+```
+
+The sentinel value `0x2BCA2875F4373FFF` is a **null/unset marker** (overflows as a date). Its lower 4 bytes (`0x2BCA2875` = 734,668,917) were previously misidentified as a Cocoa "schema date."
 
 Conversion:
 ```python
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-COCOA_EPOCH_OFFSET = 978307200
-unix_ts = cocoa_timestamp + COCOA_EPOCH_OFFSET
-dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+DOTNET_EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
+DOTNET_TICKS_PER_SECOND = 10_000_000
+
+dt = DOTNET_EPOCH + timedelta(seconds=ticks / DOTNET_TICKS_PER_SECOND)
 ```
-
-Timestamps are located by scanning every 4-byte-aligned offset in the decompressed record and checking if the resulting uint32 falls within the plausible Cocoa range.
 
 ### Property Encoding
 
@@ -707,9 +723,10 @@ SLOT_HEADER_SIZE    = 32               # 8B hash + 8B store_id + 4x uint32
 SLOT_DATA_SIZE      = 480              # SLOT_SIZE - SLOT_HEADER_SIZE
 DATA_PAGE_TYPE      = 8               # uint32 at page+16 for data pages
 RECORD_ID_SIZE      = 8               # Uncompressed record ID prefix
-COCOA_EPOCH_OFFSET  = 978307200       # Seconds between Unix (1970) and Cocoa (2001) epochs
-COCOA_TS_MIN        = 599_616_000     # ~2020-01-01
-COCOA_TS_MAX        = 915_148_800     # ~2030-01-01
+DOTNET_TICKS_PER_SECOND = 10_000_000                   # 100-nanosecond intervals per second
+DOTNET_SENTINEL     = b"\xff\x3f\x37\xf4\x75\x28\xca\x2b"  # Null/unset timestamp marker
+DOTNET_TICKS_MIN    = 633_979_008_000_000_000  # ~2010-01-01
+DOTNET_TICKS_MAX    = 642_297_024_000_000_000  # ~2030-01-01
 DEADBEEF_SENTINEL   = 0xDEADBEEF     # Marks unused header section pointers
 BLOB_COMPRESS_LZ4   = 4               # Blob page compression type for LZ4
 SECTION_MARKER      = b'\x00\x01\x00\x00\x00\x00\x01'  # Record section delimiter
@@ -736,7 +753,7 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 - **Sender extraction** -- email address and display name (UTF-16LE)
 - **Subject line extraction** (UTF-16LE)
 - **Body preview extraction** (UTF-16LE)
-- **Approximate timestamp extraction** (Cocoa epoch scanning)
+- **Timestamp extraction** — .NET ticks decoded from 48-byte sentinel blocks (100% extraction rate)
 - **Full-text search** across decompressed records and blob pages (UTF-8 + UTF-16LE)
 - **HTML body extraction** from blob pages
 - **Record enumeration**, ID-based lookup, and format type classification
@@ -745,7 +762,7 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 
 ### What Does Not Work (Yet)
 
-**Body resolution** now works for **59% of emails** via 5 tiers (inline record, blob page, object stream, EFMData .dat file, and heuristic HTML scan). The remaining ~40% are **un-synced bodies** (confirmed by the `_bodyDownloadStatus` property indicating the body was never downloaded from the server).
+**Body resolution** now works for **59% of emails** via 5 tiers (inline record, blob page, object stream, EFMData .dat file, and heuristic HTML scan). The remaining ~40% are **un-synced bodies** (confirmed by the `_bodyDownloadStatus` property indicating the body was never downloaded from the server). **Timestamps** are now fully decoded (.NET ticks in a 48-byte sentinel block — see [Section 12](#12-data-encoding-details)).
 
 | Gap | Description |
 |-----|-------------|
@@ -755,7 +772,6 @@ FORMAT_METADATA     = 0x0150           # 336: Small metadata records
 | Index page traversal | B-tree index pages are identified but not parsed; lookups require full sequential scan. |
 | Calendar event fields | Start/end times, location, attendees are not mapped. |
 | Recipient differentiation | To/CC/BCC classification is heuristic only. |
-| Exact timestamp field offsets | Timestamps found by range scanning, not by known field offset. |
 
 ---
 

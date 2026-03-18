@@ -12,7 +12,15 @@ import struct
 from datetime import datetime, timezone
 from typing import Callable
 
-from hxdecode.constants import COCOA_EPOCH_OFFSET, COCOA_TS_MAX, COCOA_TS_MIN
+from hxdecode.constants import (
+    COCOA_EPOCH_OFFSET,
+    COCOA_TS_MAX,
+    COCOA_TS_MIN,
+    DOTNET_SENTINEL,
+    DOTNET_TICKS_MAX,
+    DOTNET_TICKS_MIN,
+    DOTNET_TICKS_PER_SECOND,
+)
 
 # ---------------------------------------------------------------------------
 # Month name lookup for date parsing
@@ -394,21 +402,13 @@ def extract_content_date(
 # .NET ticks timestamp extraction (definitive)
 # ---------------------------------------------------------------------------
 
-# Sentinel value that brackets displayTime in the 48-byte timestamp block.
-# Structure: [8B sync_time] [8B sentinel] [8B displayTime] [8B sentinel] [8B sentinel] [8B sentinel]
-_DOTNET_SENTINEL = b"\xff\x3f\x37\xf4\x75\x28\xca\x2b"
-_TICKS_PER_SECOND = 10_000_000
 _DOTNET_EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
-
-# Plausible .NET ticks range: 2010-01-01 to 2030-01-01
-_TICKS_MIN = 633_979_008_000_000_000  # 2010-01-01
-_TICKS_MAX = 642_297_024_000_000_000  # 2030-01-01
 
 
 def _ticks_to_datetime(ticks: int) -> datetime:
     """Convert .NET ticks to a datetime."""
     from datetime import timedelta
-    return _DOTNET_EPOCH + timedelta(seconds=ticks / _TICKS_PER_SECOND)
+    return _DOTNET_EPOCH + timedelta(seconds=ticks / DOTNET_TICKS_PER_SECOND)
 
 
 def extract_dotnet_timestamp(data: bytes) -> datetime | None:
@@ -429,7 +429,7 @@ def extract_dotnet_timestamp(data: bytes) -> datetime | None:
     """
     pos = 0
     while True:
-        idx = data.find(_DOTNET_SENTINEL, pos)
+        idx = data.find(DOTNET_SENTINEL, pos)
         if idx == -1:
             break
 
@@ -441,11 +441,11 @@ def extract_dotnet_timestamp(data: bytes) -> datetime | None:
         ticks = struct.unpack_from("<q", data, ts_offset)[0]
 
         # Verify it's in plausible range
-        if _TICKS_MIN <= ticks <= _TICKS_MAX:
+        if DOTNET_TICKS_MIN <= ticks <= DOTNET_TICKS_MAX:
             # Verify: next 8 bytes should also be the sentinel
             verify_offset = ts_offset + 8
             if verify_offset + 8 <= len(data):
-                if data[verify_offset : verify_offset + 8] == _DOTNET_SENTINEL:
+                if data[verify_offset : verify_offset + 8] == DOTNET_SENTINEL:
                     try:
                         return _ticks_to_datetime(ticks)
                     except (OSError, OverflowError, ValueError):
@@ -526,6 +526,94 @@ def _extract_cocoa_median(data: bytes) -> datetime | None:
         return datetime.fromtimestamp(unix_ts, tz=timezone.utc)
     except (OSError, OverflowError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Email field extraction (sender, subject)
+# ---------------------------------------------------------------------------
+
+# Module-level email regex for UTF-16 string matching (text, not bytes).
+_TEXT_EMAIL_RE = re.compile(r"[\w.+-]+@[\w.]+\.\w{2,6}")
+
+
+def _extract_subject_from_sequence(strings: list[str]) -> str:
+    """Extract subject from a string sequence: msg_ids... -> body_preview -> subject."""
+    pos = 0
+    for s in strings:
+        if s.startswith("<") and "@" in s:
+            pos += 1
+        else:
+            break
+    remaining = strings[pos:]
+    if len(remaining) >= 2:
+        return remaining[1]
+    elif len(remaining) == 1:
+        return remaining[0]
+    return ""
+
+
+def extract_email_fields(
+    utf16_strings: list[str], raw_fmt: int
+) -> tuple[str, str, str]:
+    """Extract sender_email, sender_name, and subject from UTF-16LE strings.
+
+    This centralises the format-specific string-sequence parsing that was
+    previously duplicated in cli.py's _decompress_and_extract.
+
+    Args:
+        utf16_strings: Pre-extracted UTF-16LE strings from the decompressed
+                       record payload.
+        raw_fmt: The record format type (uint32 at record_data[8]).
+
+    Returns:
+        Tuple of (sender_email, sender_name, subject).
+    """
+    skip_strs = {"IPM.Note", "Standard", "Normal"}
+    sender_email = ""
+    sender_name = ""
+    subject = ""
+
+    if "IPM.Note" not in utf16_strings:
+        return sender_email, sender_name, subject
+
+    ipm_idx = utf16_strings.index("IPM.Note")
+    after_ipm = utf16_strings[ipm_idx + 1:]
+
+    if raw_fmt in (0x03B0, 0x03B1):
+        for s in after_ipm:
+            if s in skip_strs:
+                break
+            if not sender_email and _TEXT_EMAIL_RE.fullmatch(s):
+                sender_email = s
+            elif sender_email and not sender_name and "@" not in s and "<" not in s:
+                sender_name = s
+                break
+
+        ipm_positions = [i for i, s in enumerate(utf16_strings) if s == "IPM.Note"]
+        if len(ipm_positions) >= 2:
+            after_ipm2 = utf16_strings[ipm_positions[1] + 1:]
+            subject = _extract_subject_from_sequence(after_ipm2)
+    elif raw_fmt == 0x0191:
+        if len(after_ipm) >= 1 and _TEXT_EMAIL_RE.fullmatch(after_ipm[0]):
+            sender_email = after_ipm[0]
+        if len(after_ipm) >= 4:
+            sender_name = after_ipm[3]
+            subject = after_ipm[4] if len(after_ipm) >= 5 else ""
+    else:
+        subject = _extract_subject_from_sequence(after_ipm)
+
+        for s in utf16_strings:
+            if s in skip_strs or s == subject:
+                continue
+            if s.startswith("<"):
+                continue
+            if _TEXT_EMAIL_RE.fullmatch(s) and not sender_email:
+                sender_email = s
+            elif sender_email and not sender_name and "@" not in s and "<" not in s and len(s) >= 2:
+                sender_name = s
+                break
+
+    return sender_email, sender_name, subject
 
 
 # ---------------------------------------------------------------------------
