@@ -10,8 +10,25 @@ from __future__ import annotations
 import re
 import struct
 from datetime import datetime, timezone
+from typing import Callable
 
 from hxdecode.constants import COCOA_EPOCH_OFFSET, COCOA_TS_MAX, COCOA_TS_MIN
+
+# ---------------------------------------------------------------------------
+# Month name lookup for date parsing
+# ---------------------------------------------------------------------------
+
+_MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# ---------------------------------------------------------------------------
+# Plausible year range for content-extracted dates
+# ---------------------------------------------------------------------------
+
+_YEAR_MIN = 2015
+_YEAR_MAX = 2027
 
 # ---------------------------------------------------------------------------
 # Email addresses
@@ -135,13 +152,279 @@ def extract_timestamps(data: bytes) -> list[datetime]:
     return timestamps
 
 
-def extract_display_time(data: bytes) -> datetime | None:
+# ---------------------------------------------------------------------------
+# Content-based date extraction strategies
+# ---------------------------------------------------------------------------
+
+# Strategy 1: 13-digit Unix millisecond timestamps in Message-ID strings.
+# Example: <83236174.457198108.1767749130069@email.apple.com>
+# The 1767749130069 is Unix ms -> 2026-01-07 01:25:30 UTC.
+_MSGID_RE = re.compile(r"<[^>]*?(\d{13})[^>]*?@[^>]+>")
+
+
+def _extract_msgid_timestamp(
+    decompressed: bytes, utf16_strings: list[str]
+) -> datetime | None:
+    """Extract a date from a 13-digit Unix-ms timestamp in a Message-ID."""
+    for s in utf16_strings:
+        m = _MSGID_RE.match(s)
+        if m:
+            ts_ms = int(m.group(1))
+            ts_s = ts_ms / 1000.0
+            try:
+                dt = datetime.fromtimestamp(ts_s, tz=timezone.utc)
+                if _YEAR_MIN <= dt.year <= _YEAR_MAX:
+                    return dt
+            except (OSError, OverflowError, ValueError):
+                continue
+    return None
+
+
+# Strategy 2: Date strings in body preview / forwarded headers.
+# Matches "Date: Thu, 2 Nov 2017" or "On Mon, 25 Oct 2017".
+_BODY_DATE_RE = re.compile(
+    r"(?:Date|On)\s*[,:]\s*"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
+    r"(\d{1,2})\s+"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+"
+    r"(\d{4})",
+    re.IGNORECASE,
+)
+
+# Optional time part following the date, e.g. "19:10" or "7:30"
+_BODY_TIME_RE = re.compile(
+    r"(?:Date|On)\s*[,:]\s*"
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
+    r"\d{1,2}\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+"
+    r"\d{4},?\s+"
+    r"(\d{1,2}):(\d{2})",
+    re.IGNORECASE,
+)
+
+
+def _extract_body_date(
+    decompressed: bytes, utf16_strings: list[str]
+) -> datetime | None:
+    """Extract a date from 'Date:' or 'On ...' lines in the body preview."""
+    all_text = " ".join(utf16_strings)
+    m = _BODY_DATE_RE.search(all_text)
+    if not m:
+        return None
+    try:
+        day = int(m.group(1))
+        month = _MONTH_NAMES.get(m.group(2).lower()[:3])
+        year = int(m.group(3))
+        if month is None or not (_YEAR_MIN <= year <= _YEAR_MAX):
+            return None
+        hour, minute = 0, 0
+        tm = _BODY_TIME_RE.search(all_text)
+        if tm:
+            hour, minute = int(tm.group(1)), int(tm.group(2))
+        return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+# Strategy 3: Compact timestamps in subject lines.
+# Example: "Version 1.0 (202601070121)" -> YYYYMMDDHHSS format.
+_SUBJECT_DATE_RE = re.compile(r"\((\d{4})(\d{2})(\d{2})(\d{2})(\d{2})\)")
+
+
+def _extract_subject_date(
+    decompressed: bytes, utf16_strings: list[str]
+) -> datetime | None:
+    """Extract a YYYYMMDDHHSS date from parenthesized timestamps in subjects."""
+    for s in utf16_strings:
+        m = _SUBJECT_DATE_RE.search(s)
+        if m:
+            try:
+                year = int(m.group(1))
+                month = int(m.group(2))
+                day = int(m.group(3))
+                hour = int(m.group(4))
+                minute = int(m.group(5))
+                if not (_YEAR_MIN <= year <= _YEAR_MAX):
+                    continue
+                return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+            except (ValueError, OverflowError):
+                continue
+    return None
+
+
+# Strategy 4: Date: header in inline HTML (forwarded email headers).
+# Same pattern as body date but searched in raw decompressed bytes.
+_HTML_DATE_RE = re.compile(
+    rb"Date:\s*"
+    rb"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
+    rb"(\d{1,2})\s+"
+    rb"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+"
+    rb"(\d{4})",
+    re.IGNORECASE,
+)
+
+_HTML_TIME_RE = re.compile(
+    rb"Date:\s*"
+    rb"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
+    rb"\d{1,2}\s+"
+    rb"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+"
+    rb"\d{4},?\s+"
+    rb"(\d{1,2}):(\d{2})",
+    re.IGNORECASE,
+)
+
+
+def _extract_html_date(
+    decompressed: bytes, utf16_strings: list[str]
+) -> datetime | None:
+    """Extract a Date: header from inline HTML in the decompressed data."""
+    m = _HTML_DATE_RE.search(decompressed)
+    if not m:
+        return None
+    try:
+        day = int(m.group(1))
+        month = _MONTH_NAMES.get(m.group(2).decode("ascii").lower()[:3])
+        year = int(m.group(3))
+        if month is None or not (_YEAR_MIN <= year <= _YEAR_MAX):
+            return None
+        hour, minute = 0, 0
+        tm = _HTML_TIME_RE.search(decompressed)
+        if tm:
+            hour, minute = int(tm.group(1)), int(tm.group(2))
+        return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+# Strategy 5: ASCII date strings in decompressed data.
+# Searches for ISO 8601 (2026-01-07), RFC 2822 (Thu, 02 Nov 2017),
+# and compact dates (20261107).
+_ISO_DATE_RE = re.compile(rb"(20[12]\d)-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])")
+_RFC_DATE_RE = re.compile(
+    rb"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+"
+    rb"(\d{1,2})\s+"
+    rb"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+"
+    rb"(20[12]\d)",
+    re.IGNORECASE,
+)
+_COMPACT_DATE_RE = re.compile(rb"(20[12]\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])")
+
+
+def _extract_ascii_date(
+    decompressed: bytes, utf16_strings: list[str]
+) -> datetime | None:
+    """Extract a date from ASCII date patterns in the decompressed payload."""
+    # Try RFC 2822 dates first (most specific)
+    for m in _RFC_DATE_RE.finditer(decompressed):
+        try:
+            day = int(m.group(1))
+            month = _MONTH_NAMES.get(m.group(2).decode("ascii").lower()[:3])
+            year = int(m.group(3))
+            if month is None or not (_YEAR_MIN <= year <= _YEAR_MAX):
+                continue
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except (ValueError, OverflowError):
+            continue
+
+    # Then ISO 8601 dates
+    for m in _ISO_DATE_RE.finditer(decompressed):
+        try:
+            year = int(m.group(1))
+            month = int(m.group(2))
+            day = int(m.group(3))
+            if not (_YEAR_MIN <= year <= _YEAR_MAX):
+                continue
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except (ValueError, OverflowError):
+            continue
+
+    # Compact dates are the least specific -- high false positive risk from
+    # non-date digit sequences, so skip them (they added very few matches
+    # in testing and would need careful filtering).
+    return None
+
+
+# Ordered list of content-date extraction strategies (highest priority first).
+_CONTENT_DATE_STRATEGIES: list[
+    tuple[str, Callable[[bytes, list[str]], datetime | None]]
+] = [
+    ("msgid_timestamp", _extract_msgid_timestamp),
+    ("body_date", _extract_body_date),
+    ("subject_date", _extract_subject_date),
+    ("html_date", _extract_html_date),
+    ("ascii_date", _extract_ascii_date),
+]
+
+
+def extract_content_date(
+    decompressed: bytes, utf16_strings: list[str]
+) -> datetime | None:
+    """Extract the send/receive date from email record content.
+
+    Tries multiple extraction strategies in priority order, returning
+    the first successful result:
+
+    1. **Message-ID timestamp**: 13-digit Unix-ms values embedded in
+       Message-ID strings (e.g. ``1767749130069``).
+    2. **Body preview dates**: ``Date:`` or ``On ...`` lines with
+       RFC 2822-style day-month-year dates.
+    3. **Subject line dates**: Compact ``(YYYYMMDDHHSS)`` timestamps
+       in subject lines (e.g. from Apple build notifications).
+    4. **HTML Date: header**: ``Date:`` headers in inline HTML from
+       forwarded emails (0x03B0 records).
+    5. **ASCII date strings**: ISO 8601, RFC 2822, or compact date
+       patterns found anywhere in the decompressed payload.
+
+    Args:
+        decompressed: Decompressed record payload bytes.
+        utf16_strings: Pre-extracted UTF-16LE strings from the payload.
+
+    Returns:
+        A timezone-aware UTC datetime, or ``None`` if no date could be
+        extracted from the content.
+    """
+    for _name, strategy in _CONTENT_DATE_STRATEGIES:
+        result = strategy(decompressed, utf16_strings)
+        if result is not None:
+            return result
+    return None
+
+
+def extract_display_time(
+    data: bytes,
+    utf16_strings: list[str] | None = None,
+) -> datetime | None:
     """Extract the best-guess display/send time for an email record.
 
-    The actual displayTime property offset in the Cola schema has not
-    been decoded. This function uses a heuristic: collect all plausible
-    Cocoa timestamps, exclude known schema dates (which appear identically
-    in all records), and return the median of the remaining values.
+    First attempts to extract a date from the email content (Message-ID
+    timestamps, body dates, subject lines, etc.) which is significantly
+    more accurate than the Cocoa timestamp heuristic. Falls back to the
+    Cocoa median heuristic only when content extraction fails.
+
+    Args:
+        data: Decompressed record payload bytes.
+        utf16_strings: Optional pre-extracted UTF-16LE strings. If not
+            provided, they will be extracted from *data*.
+
+    Returns:
+        A single datetime, or None if no plausible timestamp is found.
+    """
+    # Try content-based extraction first (accurate)
+    if utf16_strings is None:
+        utf16_strings = extract_utf16le_strings(data)
+    content_date = extract_content_date(data, utf16_strings)
+    if content_date is not None:
+        return content_date
+
+    # Fall back to Cocoa timestamp scanning (less accurate)
+    return _extract_cocoa_median(data)
+
+
+def _extract_cocoa_median(data: bytes) -> datetime | None:
+    """Extract a date via the Cocoa-epoch median heuristic (fallback).
+
+    Scans for uint32_le values in the Cocoa timestamp range, excludes
+    known schema dates, and returns the median.
 
     Args:
         data: Decompressed record payload bytes.

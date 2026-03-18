@@ -191,7 +191,7 @@ def _decompress_and_extract(rec) -> dict[str, Any]:
         "emails": all_emails,
         "utf16_strings": utf16,
         "timestamps": timestamps,
-        "timestamp": extract_display_time(decompressed),
+        "timestamp": extract_display_time(decompressed, utf16),
         "decompressed": decompressed,
         "raw_data": rec.raw_data,
     }
